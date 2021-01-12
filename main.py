@@ -1,9 +1,9 @@
-import gzip
+import os, sys, platform, time, gzip
 from PyQt5 import QtWidgets, Qt, QtGui, QtCore, uic
+from PyQt5.QtCore import QMutex, QProcess, QThread, QObject, pyqtSignal, pyqtSlot
 from Bio import SeqIO
-import os, sys, platform, time
-
-import matplotlib
+from functools import partial
+import matplotlib, subprocess
 matplotlib.use('QT5Agg')
 
 import matplotlib.pyplot as plt
@@ -23,11 +23,15 @@ class MyMainWindow(QtWidgets.QMainWindow):
         self.path1 = "" #Path to crRNA file
         self.path2 = "" #Path to ref file
         self.path3 = "" #Path to query file
-        self.mash_all = {} #Holds all mash output 
+        self.mash_all = {} #Holds all mash output
         self.mash_dict = {} #Holds filtered mash output data
         self.output = [] #List to hold all output data
+        self.mash_out = None
 
-        ### crRNA table settings
+        ###Progress bar stuff
+        self.progress_val = 0 ###Initialize progress bar value
+
+        ###crRNA table settings
         self.crRNA_table.setColumnCount(7)  # hardcoded because there will always be nine columns
         self.crRNA_table.setShowGrid(False)
         self.crRNA_table.setHorizontalHeaderLabels("Gene;Sequence;Avg. Off-Target;On-Target;Location;PAM;Strand".split(";"))
@@ -48,9 +52,10 @@ class MyMainWindow(QtWidgets.QMainWindow):
         self.browse_2.clicked.connect(self.get_file2)
         self.browse_3.clicked.connect(self.get_file3)
         self.run_OT.clicked.connect(self.run_all)
+
+        ###Show main GUI
         self.show()
 
-    """ Start defining functions here """
     def table_sorting(self, logicalIndex):
         self.switcher[logicalIndex] *= -1
         if self.switcher[logicalIndex] == -1:
@@ -129,18 +134,19 @@ class MyMainWindow(QtWidgets.QMainWindow):
         It calls the functions that run Mash, Index Builder, Off-Target Algorithm, and requisite parsing
         functions.
         """
-        self.run_mash()
-        self.filter_query()
-        #self.build_index(self.filtered_out_path)
-        self.format_gRNA(self.path1)
-        self.OTF()
-        self.output_parse()
+
+        self.run_mash() ###Run MASH analysis
+        self.filter_query() ###Filter fasta sequences out based on p value
+        self.build_index(self.filtered_out_path) ###Build index for off-target analysis
+        os.remove(self.filtered_out_path) ###Clean up intermediate fasta file
+        self.format_gRNA(self.path1) ###Format everything in the right order
+        self.run_OTF() ###Run off-target analysis
+        self.output_parse() ###Parse output values and update table
 
     def run_mash(self):
         """
         This function rans Mash and saves the output to self.mash_out_path
         """
-
         if (self.path2 != "" and self.path3 != ""):
             ###Set up command###
             # <exe path> dist <options> <ref seq> <query seq>
@@ -155,30 +161,29 @@ class MyMainWindow(QtWidgets.QMainWindow):
             cmd = ""
             flag_str = "-s 10000 -k 16 -i"
             cmd += path_to_exe + " dist " + " " + flag_str + " " + ref_file + " " + query_file + " > " + self.mash_out_path
-            os.system(cmd) ###Run the command
+            os.system(cmd)
+
         else:
             QtWidgets.QMessageBox.question(self, "Error!","You must select reference and query .fasta files.",QtWidgets.QMessageBox.Ok)
 
     def build_index(self, input_fasta):
     ###"path to exe" "endo" "PAM" "org_code" "FALSE" "output dir" "CASPERinfo" "query file" "org_name "guide length" "seed length" " "
         if self.mash_out_path: ###Makes sure that Mash has been run first
-            path_to_exe = os.getcwd() + "/bin/index_builder_linux"
+            path_to_exe = os.getcwd() + "/bin/SeqFinder_mac"
             org_code = "temp"
             endo = "spCas9"
             pam = "NGG"
-            output_dir = os.getcwd()
-            self.index = output_dir + "/temp_spCas9.cspr"
+            output_dir = os.getcwd() + "/"
+            self.index = output_dir + "temp_spCas9.cspr"
             org_name = "temp_index"
-            guide_len = "20"
+            five_tail_len = "4"
+            three_tail_len = "0"
             seed_len = "16"
-            index_cmd = '"' + path_to_exe + '" "' + endo + '" "' + pam + '" "' + org_code + '" "' + "FALSE" + '" "' + output_dir + '" "' + self.casper_info + '" "' + input_fasta + '" "' + org_name + '" "' + guide_len + '" "'  + seed_len + '" " "'
-            print(index_cmd)
+            index_cmd = '"' + path_to_exe + '" "' + endo + '" "' + pam + '" "' +  "TRUE" + '" "' + "FALSE" + '" "' + five_tail_len + '" "' + seed_len + '" "' + three_tail_len + '" "' + org_code + '" "' + output_dir + '" "' + self.casper_info + '" "' + input_fasta + '" "' + org_name + '" "' + "Index file for CASPERvip" + '"'
             os.system(index_cmd)
-            os.remove(input_fasta) ###Clean up intermediate fasta file
 
         else:
             QtWidgets.QMessageBox.question(self, "Error!","Run Mash first!",QtWidgets.QMessageBox.Ok)
-
 
     def format_gRNA(self, input_file):
         """
@@ -203,8 +208,8 @@ class MyMainWindow(QtWidgets.QMainWindow):
         """
         This function filters out query sequences with p-values under 0.001
         """
-        with open(self.mash_out_path) as f:
-            for line in f:
+        with open(self.mash_out_path, "r") as f:
+            for line in f.readlines():
                 line = " ".join(line.split())
                 hold = []
                 for x in line.split(' '):
@@ -212,8 +217,6 @@ class MyMainWindow(QtWidgets.QMainWindow):
                 self.mash_all[str(hold[1])] = ["--", hold[2], hold[3]] ## Holds entire mash output
                 if (float(hold[3]) > 0.001 or float(hold[3]) == 0):
                     self.mash_dict[str(hold[1])] = ["--", hold[2], hold[3]] ## key = fasta id = [name, distance, p-val], holds filtered mash output
-        f.close()
-        os.remove(self.mash_out_path) ###Delete intermediate Mash file
 
         q = SeqIO.parse(open(self.path3), 'fasta')
         self.filtered_out_path = os.getcwd() + "/filtered_query.fasta"  ## Holds sequences for off-target algorithm
@@ -231,22 +234,22 @@ class MyMainWindow(QtWidgets.QMainWindow):
                     self.mash_dict[id][0] = name
                     SeqIO.write(fasta, outfile, 'fasta')
 
-    def OTF(self):
+        self.progress_val += 100/6
+
+    def run_OTF(self):
         """
         This function runs the Off-Target Algorithm and saves it to OT_results.txt
         """
         ### "path to exe" "compressed guides" True "CSPR path" "output directory" "CASPERinfo path" [max mismatches = (3-5)] [tolerance value = 0.05] [average output] [detailed output]
-        path_to_exe = os.getcwd() + "/bin/OT_linux"
+        path_to_exe = os.getcwd() + "/bin/OT_mac"
         path_to_guides = self.guides
-        self.index =  os.getcwd() + "/bin/skin_spCas9.cspr" ###Index file containing unique sequences and organism info
-        self.db =  os.getcwd() + "/bin/skin_spCas9_repeats.db"
+        self.index =  os.getcwd() + "/temp_spCas9.cspr" ###Index file containing unique sequences and organism info
+        self.db =  os.getcwd() + "/temp_spCas9_repeats.db"
         CSPR_path = self.index
         self.ot_out = os.getcwd() + "/OT_results.txt"
-        index_cmd = '"' + path_to_exe + '" "' + path_to_guides + '" "' + CSPR_path + '" "' + self.db + '" "' + self.ot_out + '" "' + self.casper_info + '" ' + "3" + " " + "0.05" + ' ' + "True False"
-        print(index_cmd)
-        os.system(index_cmd)
-        os.remove(self.guides) ###Removes intermediate gRNA file
-
+        ot_cmd = '"' + path_to_exe + '" "' + path_to_guides + '" "' + CSPR_path + '" "' + self.db + '" "' + self.ot_out + '" "' + self.casper_info + '" ' + "3" + " " + "0.05" + ' ' + "True False"
+        print(ot_cmd)
+        os.system(ot_cmd)
 
     def output_parse(self):
         """
@@ -254,9 +257,8 @@ class MyMainWindow(QtWidgets.QMainWindow):
         """
 
         off_target = open(self.ot_out, 'r')
-
-
         for x in off_target:
+            print(x)
             if x[0] != '0':
                 if x[0] == "D":
                     continue
@@ -269,7 +271,7 @@ class MyMainWindow(QtWidgets.QMainWindow):
                 split_2 = split_2.split(",") # split_2[0] holds off-target score, split_2[1] holds index in index_file
                 ### output list = sequence, off-target score, off-target organism, distance, gene, location, PAM, strand, on-target score
                 self.output.append([str(split_1[0]), split_2[0], split_2[1], "distance", self.crRNA_dict[split_1[0]][0], self.crRNA_dict[split_1[0]][3], self.crRNA_dict[split_1[0]][4], self.crRNA_dict[split_1[0]][5], self.crRNA_dict[split_1[0]][2]])
-            
+
         ## Error generated if off-target output file shows all scores as 0
         if not self.output:
             QtWidgets.QMessageBox.question(self, "Error!","Check off-target output file",QtWidgets.QMessageBox.Ok)
@@ -308,10 +310,10 @@ class MyMainWindow(QtWidgets.QMainWindow):
             avg_off = QtWidgets.QTableWidgetItem(str(y[1]))
             self.crRNA_table.setItem(index, 2, avg_off)
         self.crRNA_table.resizeColumnsToContents()
-        
-    
+
+
        #with open('./test_files/example_plottable.csv', 'r') as f:
-    
+
        #     count = 0
        #     for x in f:
        #         if count > 0:
@@ -321,7 +323,7 @@ class MyMainWindow(QtWidgets.QMainWindow):
        #         count += 1
 
         markers = ['.', 'o', 'v', '^', '<', '>', '1', '2', '3', '4']
-        
+
         organismList = {}
 
         for row in  self.output:
@@ -329,7 +331,7 @@ class MyMainWindow(QtWidgets.QMainWindow):
                 if not row[2] in organismList:
                     organismList[row[2]] = []
                 organismList[row[2]].append((row[1], row[3]))
-            
+
 
         fig, axs = plt.subplots()
 
@@ -354,23 +356,18 @@ class MyMainWindow(QtWidgets.QMainWindow):
         axs.set_title('gRNA selection')
         axs.add_artist(legend1)
         plt.tight_layout()
-        
+
         self.plotWidget = FigureCanvas(fig)
         lay = QtWidgets.QVBoxLayout(self.total_crRNA)
         lay.setContentsMargins(0,0,0,0)
         lay.addWidget(self.plotWidget)
-        
+
 
         ## self.output  ---list of lists containing data for plotting
         ## Format for each index in the list: (sequence, off-target score, off-target organism, distance, gene, location, PAM, strand, on-target score
 
-
-###Plot data
-
-
 if __name__ == '__main__':
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-    #app = Qt.QApplication(sys.argv)
     app = QtWidgets.QApplication(sys.argv)
     window = MyMainWindow()
     app.setApplicationName("crRNA Viewer")
